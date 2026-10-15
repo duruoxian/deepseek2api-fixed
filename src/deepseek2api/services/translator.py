@@ -473,13 +473,39 @@ def convert_deepseek_to_openai_chunk(
     operation = data.get("o", "")
     value = data.get("v")
 
+    # 新片段声明：response/fragments APPEND [{id, type, content}]
+    # DeepSeek expert 模式会先开 THINK 片段（思考），结束后再开 RESPONSE 片段（正文，
+    # 工具调用的 DSML 就在这里）。必须在此更新 last_fragment_type，否则后续裸值/续写
+    # 会被误判为 thinking，导致 DSML 工具调用混进 reasoning_content 无法解析。
+    if operation == "APPEND" and path == "response/fragments" and isinstance(value, list):
+        out_delta = None
+        for frag in value:
+            if not isinstance(frag, dict):
+                continue
+            frag_type = frag.get("type", "RESPONSE")
+            state.last_fragment_type = frag_type
+            content = frag.get("content", "")
+            if isinstance(content, str) and content:
+                delta = {}
+                if state.is_first_content:
+                    delta["role"] = "assistant"
+                    state.is_first_content = False
+                if frag_type in ("THINK", "THINKING"):
+                    delta["reasoning_content"] = content
+                else:
+                    delta["content"] = content
+                out_delta = delta
+        if out_delta is not None:
+            return _build_chunk(model, out_delta, None, completion_id)
+        return None
+
     # 裸 {"v": "..."} 追加
     if not path and not operation and isinstance(value, str) and value:
         delta = {}
         if state.is_first_content:
             delta["role"] = "assistant"
             state.is_first_content = False
-        if state.last_fragment_type == "THINKING":
+        if state.last_fragment_type in ("THINK", "THINKING"):
             delta["reasoning_content"] = value
         else:
             delta["content"] = value
@@ -493,7 +519,7 @@ def convert_deepseek_to_openai_chunk(
         if state.is_first_content:
             delta["role"] = "assistant"
             state.is_first_content = False
-        if "thinking" in path.lower() or state.last_fragment_type == "THINKING":
+        if "thinking" in path.lower() or state.last_fragment_type in ("THINK", "THINKING"):
             delta["reasoning_content"] = value
         else:
             delta["content"] = value
@@ -546,7 +572,7 @@ def convert_deepseek_to_openai_chunk(
                         delta["role"] = "assistant"
                         state.is_first_content = False
 
-                    if frag_type == "THINKING":
+                    if frag_type in ("THINK", "THINKING"):
                         delta["reasoning_content"] = content
                     else:
                         delta["content"] = content

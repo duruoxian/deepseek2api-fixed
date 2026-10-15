@@ -58,6 +58,7 @@ from .citation_utils import CitationStripper, strip_citation_marks
 RATE_LIMIT_COOLDOWN_SECONDS = 60
 MAX_RATE_LIMIT_RETRIES = 3
 MAX_CONTEXT_LENGTH_RETRIES = 2
+MAX_FILE_PARSE_RETRIES = 1
 
 
 class UpstreamAPIError(RuntimeError):
@@ -77,6 +78,10 @@ class ContextLengthExceededError(RuntimeError):
 
 class RateLimitError(RuntimeError):
     """DeepSeek 返回 rate_limit_reached（消息发送过于频繁）。"""
+
+
+class FileParseError(RuntimeError):
+    """DeepSeek 返回 file_parse_error（上传的文件解析失败，消息被拒）。"""
 
 
 @dataclass(slots=True)
@@ -159,6 +164,31 @@ class ConcurrentRequestQueue:
 # ═══════════════════════════════════════════════════════════
 # Conversation helpers
 # ═══════════════════════════════════════════════════════════
+
+def _strip_image_messages(payload: dict) -> dict:
+    """返回去掉所有 image_url 的多模态内容后的 payload 副本（纯文本降级用）。"""
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return payload
+    new_messages = []
+    for m in messages:
+        if not isinstance(m, dict):
+            new_messages.append(m)
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            new_messages.append(m)
+            continue
+        kept = [p for p in content if not (isinstance(p, dict) and p.get("type") == "image_url")]
+        if not kept:
+            kept = [{"type": "text", "text": "[图片已忽略：上游解析失败]"}]
+        new_m = dict(m)
+        new_m["content"] = kept
+        new_messages.append(new_m)
+    new_payload = dict(payload)
+    new_payload["messages"] = new_messages
+    return new_payload
+
 
 def _split_messages(messages: list[dict]) -> tuple[list[dict], dict]:
     """
@@ -368,6 +398,10 @@ class DeepSeekWebClient:
             if finish_reason == "rate_limit_reached":
                 raise RateLimitError(
                     event.get("content") or "DeepSeek: 消息发送过于频繁"
+                )
+            if finish_reason == "file_parse_error":
+                raise FileParseError(
+                    event.get("content") or "DeepSeek: 文件解析失败，消息未能发送"
                 )
         return True
 
@@ -613,6 +647,7 @@ class DeepSeekWebClient:
     ) -> dict:
         context_retries = 0
         rate_limit_retries = 0
+        file_retries = 0
         has_tools = _payload_has_tools(payload)
         slot_name = f"chat:{payload.get('model', 'unknown')}"
 
@@ -714,6 +749,23 @@ class DeepSeekWebClient:
                     # 重新解析 → 由于缓存被清空 + 会话已删除，将走 fresh 路径
                     resolved = self._resolve_conversation(payload)
 
+                except FileParseError as exc:
+                    file_retries += 1
+                    self.logger.warning(
+                        "上游文件解析失败 (attempt=%d/%d): %s",
+                        file_retries, MAX_FILE_PARSE_RETRIES, exc,
+                    )
+                    self._invalidate_and_delete_session(resolved)
+                    if file_retries >= MAX_FILE_PARSE_RETRIES:
+                        raise UpstreamAPIError(
+                            status_code=502,
+                            message=f"上游文件解析失败: {exc}",
+                        ) from exc
+                    cleared = self.file_uploader.clear_cache()
+                    self.logger.warning("已清空 %d 条文件缓存，去掉附件后重试", cleared)
+                    payload = _strip_image_messages(payload)
+                    resolved = self._resolve_conversation(payload)
+
                 except RateLimitError as exc:
                     rate_limit_retries += 1
                     if rate_limit_retries >= MAX_RATE_LIMIT_RETRIES:
@@ -791,12 +843,13 @@ class DeepSeekWebClient:
         has_tools = _payload_has_tools(payload)
 
         def generate():
-            nonlocal lease
+            nonlocal lease, payload
             current_resolved = resolved
             current_session_id = current_resolved.get("session_id") or ""
             anything_yielded = False
             context_retries = 0
             rate_limit_retries = 0
+            file_retries = 0
 
             try:
                 while True:
@@ -993,6 +1046,27 @@ class DeepSeekWebClient:
                         self._invalidate_and_delete_session(current_resolved)
                         if anything_yielded or context_retries >= MAX_CONTEXT_LENGTH_RETRIES:
                             raise
+                        current_resolved = self._resolve_conversation(payload)
+                        current_session_id = current_resolved.get("session_id") or ""
+
+                    except FileParseError as exc:
+                        file_retries += 1
+                        self.logger.warning(
+                            "上游文件解析失败 (attempt=%d/%d, yielded=%s): %s",
+                            file_retries, MAX_FILE_PARSE_RETRIES, anything_yielded, exc,
+                        )
+                        self._invalidate_and_delete_session(current_resolved)
+                        if anything_yielded or file_retries >= MAX_FILE_PARSE_RETRIES:
+                            raise UpstreamAPIError(
+                                status_code=502,
+                                message=f"上游文件解析失败: {exc}",
+                            ) from exc
+                        # 清掉可能已损坏的 file_id 缓存，去掉图片重发（纯文本降级）
+                        cleared = self.file_uploader.clear_cache()
+                        self.logger.warning(
+                            "已清空 %d 条文件缓存，去掉附件后重试", cleared,
+                        )
+                        payload = _strip_image_messages(payload)
                         current_resolved = self._resolve_conversation(payload)
                         current_session_id = current_resolved.get("session_id") or ""
 
